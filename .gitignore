@@ -1,0 +1,9 @@
+dataset
+npz_dataset
+
+*.pyc
+__pycache__/
+
+checkpoints/
+
+logs

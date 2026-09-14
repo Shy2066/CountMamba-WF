@@ -16,21 +16,15 @@ from model_CountMamba import CountMambaModel
 
 warnings.filterwarnings("ignore")
 
-# Set a fixed seed for reproducibility
-fix_seed = 2024
-random.seed(fix_seed)
-torch.manual_seed(fix_seed)
-torch.cuda.manual_seed(fix_seed)
-np.random.seed(fix_seed)
-rng = np.random.RandomState(fix_seed)
-cudnn.benchmark = False
-cudnn.deterministic = True
-
 # Config
 parser = argparse.ArgumentParser(description="WFlib")
 
 # Dataset
 parser.add_argument('--dataset', default="CW")
+parser.add_argument('--seed', default=2024, type=int,
+                    help="Random seed (default: 2024)")
+parser.add_argument('--checkpoint-file', default=None, type=str,
+                    help="Optional exact checkpoint path; preserves the legacy path when omitted")
 
 # Training Strategy
 parser.add_argument('--early_stage', action="store_true")
@@ -62,9 +56,21 @@ parser.add_argument('--warmup_epochs', type=int, default=0)
 
 args = parser.parse_args()
 
+# Set a fixed seed for reproducibility.  Keep the historical default while
+# allowing the experiment runner to select a seed per training job.
+fix_seed = args.seed
+random.seed(fix_seed)
+torch.manual_seed(fix_seed)
+torch.cuda.manual_seed(fix_seed)
+np.random.seed(fix_seed)
+rng = np.random.RandomState(fix_seed)
+cudnn.benchmark = False
+cudnn.deterministic = True
+
 ckp_path = os.path.join("../checkpoints/", args.dataset, "CountMamba")
 os.makedirs(ckp_path, exist_ok=True)
-out_file = os.path.join(ckp_path, f"max_f1.pth")
+out_file = args.checkpoint_file or os.path.join(ckp_path, f"max_f1.pth")
+os.makedirs(os.path.dirname(os.path.abspath(out_file)), exist_ok=True)
 
 print(f"--------------------------------\n"
       f"Windowed Traffic Counting Matrix\n"

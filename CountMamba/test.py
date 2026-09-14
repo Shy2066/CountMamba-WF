@@ -14,23 +14,19 @@ from model_CountMamba import CountMambaModel
 
 warnings.filterwarnings("ignore")
 
-# Set a fixed seed for reproducibility
-fix_seed = 2024
-random.seed(fix_seed)
-torch.manual_seed(fix_seed)
-torch.cuda.manual_seed(fix_seed)
-np.random.seed(fix_seed)
-rng = np.random.RandomState(fix_seed)
-cudnn.benchmark = False
-cudnn.deterministic = True
-
 # Config
 parser = argparse.ArgumentParser(description="WFlib")
 
 # Dataset
 parser.add_argument('--dataset', default="CW")
+parser.add_argument('--seed', default=2024, type=int,
+                    help="Random seed (default: 2024)")
 parser.add_argument("--load_ratio", type=int, default=100)
 parser.add_argument("--result_file", type=str, default="test_p100", help="File to save test results")
+parser.add_argument('--checkpoint-file', default=None, type=str,
+                    help="Optional exact checkpoint path; preserves the legacy path when omitted")
+parser.add_argument('--output-file', default=None, type=str,
+                    help="Optional exact JSON output path; preserves the legacy path when omitted")
 parser.add_argument('--num_tabs', default=1, type=int)
 parser.add_argument('--fine_predict', action="store_true")
 # Representation
@@ -50,11 +46,22 @@ parser.add_argument('--batch_size', default=200, type=int)
 
 args = parser.parse_args()
 
+# Set a fixed seed for reproducibility while retaining the historical default.
+fix_seed = args.seed
+random.seed(fix_seed)
+torch.manual_seed(fix_seed)
+torch.cuda.manual_seed(fix_seed)
+np.random.seed(fix_seed)
+rng = np.random.RandomState(fix_seed)
+cudnn.benchmark = False
+cudnn.deterministic = True
+
 in_path = os.path.join("../npz_dataset", args.dataset)
 log_path = os.path.join("../logs", args.dataset, "CountMamba")
 ckp_path = os.path.join("../checkpoints/", args.dataset, "CountMamba")
 os.makedirs(log_path, exist_ok=True)
-out_file = os.path.join(log_path, f"{args.result_file}.json")
+out_file = args.output_file or os.path.join(log_path, f"{args.result_file}.json")
+os.makedirs(os.path.dirname(os.path.abspath(out_file)), exist_ok=True)
 
 
 # Dataset
@@ -102,7 +109,8 @@ patch_size = 2 * (args.maximum_cell_number + 1) + 2
 model = CountMambaModel(num_classes=num_classes, drop_path_rate=args.drop_path_rate, depth=args.depth,
                         embed_dim=args.embed_dim, patch_size=patch_size, max_matrix_len=args.max_matrix_len,
                         early_stage=False, num_tabs=args.num_tabs, fine_predict=args.fine_predict)
-model.load_state_dict(torch.load(os.path.join(ckp_path, f"max_f1.pth"), map_location="cpu"))
+checkpoint_file = args.checkpoint_file or os.path.join(ckp_path, f"max_f1.pth")
+model.load_state_dict(torch.load(checkpoint_file, map_location="cpu"))
 model.cuda()
 
 with torch.no_grad():
