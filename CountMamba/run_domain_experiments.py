@@ -1,12 +1,13 @@
-"""Run the CountMamba same-domain and cross-domain experiments sequentially.
+"""Run CountMamba experiments, scheduling independent tasks across GPUs.
 
 The existing ``main.py`` and ``test.py`` remain the source of truth for model
-training and evaluation.  This file only supplies explicit paths and records
-the commands/results in an isolated run directory.
+training and evaluation. This file supplies explicit paths, schedules each
+task on one GPU, and records commands/results in an isolated run directory.
 """
 
 import argparse
 import csv
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 import json
 import os
 from datetime import datetime
@@ -26,14 +27,14 @@ FIXED_ARGS = (
     "--seq_len", "5000",
     "--maximum_load_time", "120",
     "--max_matrix_len", "2700",
-    "--maximum_cell_number", "0",
+    "--maximum_cell_number", "3",
     "--log_transform",
 )
 
 
 def parse_args():
     parser = argparse.ArgumentParser(
-        description="Run CountMamba F2F/F2S/S2S/S2F experiments sequentially"
+        description="Run CountMamba F2F/F2S/S2S/S2F experiments across GPUs"
     )
     parser.add_argument(
         "--seeds", nargs="+", type=int, default=[2024],
@@ -50,7 +51,10 @@ def parse_args():
     )
     parser.add_argument(
         "--gpu", default="0",
-        help="CUDA_VISIBLE_DEVICES value (default: 0)",
+        help=(
+            "GPU IDs available to the runner, comma-separated; independent "
+            "tasks run concurrently, one per GPU (default: 0)"
+        ),
     )
     parser.add_argument(
         "--run-id", default=None,
@@ -69,6 +73,15 @@ def make_run_id(requested):
     if not requested or Path(requested).name != requested:
         raise ValueError("--run-id must be a non-empty directory name without path separators")
     return requested
+
+
+def parse_gpu_ids(gpu_arg):
+    gpu_ids = [gpu.strip() for gpu in gpu_arg.split(",")]
+    if not gpu_ids or any(not gpu for gpu in gpu_ids):
+        raise ValueError("--gpu must contain comma-separated, non-empty GPU IDs")
+    if len(set(gpu_ids)) != len(gpu_ids):
+        raise ValueError("--gpu must not contain duplicate GPU IDs")
+    return gpu_ids
 
 
 def make_directions(datasets):
@@ -112,7 +125,7 @@ def write_summary(summary, run_dir):
     fields = [
         "group_id", "seed", "direction", "source_dataset", "target_dataset",
         "accuracy", "f1", "checkpoint_file", "result_file", "log_file",
-        "status", "error",
+        "gpu", "status", "error",
     ]
     with csv_path.open("w", newline="", encoding="utf-8") as handle:
         writer = csv.DictWriter(handle, fieldnames=fields)
@@ -121,7 +134,7 @@ def write_summary(summary, run_dir):
             writer.writerow({field: record.get(field, "") for field in fields})
 
 
-def make_summary(run_id, seeds, gpu, groups):
+def make_summary(run_id, seeds, gpu_ids, groups):
     evaluations = []
     for group in groups:
         for seed in seeds:
@@ -144,7 +157,8 @@ def make_summary(run_id, seeds, gpu, groups):
     return {
         "run_id": run_id,
         "status": "running",
-        "gpu": str(gpu),
+        "gpu": ",".join(gpu_ids),
+        "gpus": gpu_ids,
         "seeds": seeds,
         "datasets": {
             "fiber": first_datasets[0],
@@ -162,7 +176,7 @@ def make_summary(run_id, seeds, gpu, groups):
             "seq_len": 5000,
             "maximum_load_time": 120,
             "max_matrix_len": 2700,
-            "maximum_cell_number": 0,
+            "maximum_cell_number": 3,
             "log_transform": True,
             "split": "train.npz/valid.npz/test.npz (4860/540/600)",
         },
@@ -272,11 +286,14 @@ def validate_inputs(groups):
 def dry_run(python, seeds, gpu, groups):
     train_count = 0
     eval_count = 0
-    env = os.environ.copy()
-    env["CUDA_VISIBLE_DEVICES"] = str(gpu)
+    gpu_ids = parse_gpu_ids(gpu)
     print(
         f"DRY-RUN: {len(groups)} dataset group(s), {len(seeds)} seed(s), "
         "2 training and 4 evaluation tasks per group/seed"
+    )
+    print(
+        f"DRY-RUN GPUs: {', '.join(gpu_ids)} "
+        f"({len(gpu_ids)} concurrent task(s) maximum)"
     )
     for group in groups:
         datasets = group["datasets"]
@@ -299,15 +316,13 @@ def dry_run(python, seeds, gpu, groups):
                 output = group_root / "results" / f"{direction}_seed_{seed}.json"
                 print("    EVAL ", command_string(build_eval_command(python, source, target, seed, checkpoint, output)))
                 eval_count += 1
-    # Keep env construction above explicit: it documents the GPU isolation used
-    # by normal execution without launching anything in dry-run mode.
-    del env
     print(f"DRY-RUN COUNTS: train={train_count}, eval={eval_count}")
     expected = len(groups) * len(seeds)
     return 0 if train_count == 2 * expected and eval_count == 4 * expected else 1
 
 
 def execute(args):
+    gpu_ids = parse_gpu_ids(args.gpu)
     groups = make_dataset_groups(args.datasets)
     validate_inputs(groups)
     run_id = make_run_id(args.run_id)
@@ -317,11 +332,12 @@ def execute(args):
     run_dir.mkdir(parents=True)
 
     python = sys.executable
-    summary = make_summary(run_id, args.seeds, args.gpu, groups)
-    env = os.environ.copy()
-    env["CUDA_VISIBLE_DEVICES"] = str(args.gpu)
+    summary = make_summary(run_id, args.seeds, gpu_ids, groups)
     write_summary(summary, run_dir)
 
+    tasks = []
+    train_task_ids = {}
+    next_task_id = 0
     for group in groups:
         group_id = group["group_id"]
         datasets = group["datasets"]
@@ -337,36 +353,33 @@ def execute(args):
                     "dataset": dataset,
                     "checkpoint_file": str(checkpoint),
                     "log_file": str(log_file),
-                    "status": "running",
+                    "status": "pending",
                 }
                 summary["training"].append(training)
-                write_summary(summary, run_dir)
-                command = build_train_command(python, dataset, seed, checkpoint)
-                print(
-                    f"TRAIN group={group_id} seed={seed} dataset={dataset}: "
-                    f"{log_file}",
-                    flush=True,
-                )
-                returncode, error = run_command(command, log_file, env)
-                if returncode != 0 or not checkpoint.is_file():
-                    training["status"] = "failed"
-                    training["returncode"] = returncode
-                    training["error"] = (
-                        error or "training exited successfully but produced no checkpoint"
-                    )
-                    summary["status"] = "failed"
-                    for record in summary["evaluations"]:
-                        if record["status"] == "pending":
-                            record["status"] = "skipped"
-                            record["error"] = "not run because training failed"
-                    update_aggregate(summary, groups)
-                    write_summary(summary, run_dir)
-                    print(f"FAILED: {training['error']}", flush=True)
-                    return 1
-                training["status"] = "success"
-                training["returncode"] = 0
-                write_summary(summary, run_dir)
+                task_id = next_task_id
+                next_task_id += 1
+                previous_task_id = train_task_ids.get((group_id, seed, dataset))
+                train_task_ids[(group_id, seed, dataset)] = task_id
+                task = {
+                    "id": task_id,
+                    "kind": "train",
+                    "record": training,
+                    "dataset": dataset,
+                    "seed": seed,
+                    "checkpoint": checkpoint,
+                    "log_file": log_file,
+                    "group_dir": group_dir,
+                    "group_id": group_id,
+                }
+                if previous_task_id is not None:
+                    task["dependency"] = previous_task_id
+                tasks.append(task)
 
+    for group in groups:
+        group_id = group["group_id"]
+        directions = group["directions"]
+        group_dir = run_dir if len(groups) == 1 else run_dir / "groups" / group_id
+        for seed in args.seeds:
             for direction, source, target in directions:
                 record = next(
                     item for item in summary["evaluations"]
@@ -377,62 +390,150 @@ def execute(args):
                 checkpoint = group_dir / "checkpoints" / f"{source}_seed_{seed}.pth"
                 output = group_dir / "results" / f"{direction}_seed_{seed}.json"
                 log_file = group_dir / "logs" / f"eval_{direction}_seed_{seed}.log"
-                record.update({
-                    "checkpoint_file": str(checkpoint),
-                    "result_file": str(output),
-                    "log_file": str(log_file),
-                    "status": "running",
+                task_id = next_task_id
+                next_task_id += 1
+                tasks.append({
+                    "id": task_id,
+                    "kind": "eval",
+                    "record": record,
+                    "direction": direction,
+                    "source": source,
+                    "target": target,
+                    "seed": seed,
+                    "checkpoint": checkpoint,
+                    "output": output,
+                    "log_file": log_file,
+                    "group_dir": group_dir,
+                    "group_id": group_id,
+                    "dependency": train_task_ids[(group_id, seed, source)],
                 })
-                write_summary(summary, run_dir)
-                command = build_eval_command(
-                    python, source, target, seed, checkpoint, output
+
+    pending_tasks = list(tasks)
+    task_states = {task["id"]: "pending" for task in tasks}
+    running = {}
+    available_gpus = list(gpu_ids)
+    failed = False
+
+    with ThreadPoolExecutor(max_workers=len(gpu_ids)) as executor:
+        while pending_tasks or running:
+            while pending_tasks and available_gpus:
+                task_index = next(
+                    (
+                        index for index, task in enumerate(pending_tasks)
+                        if task.get("dependency") is None
+                        or task_states[task["dependency"]] in ("success", "failed", "skipped")
+                    ),
+                    None,
                 )
-                print(
-                    f"EVAL group={group_id} {direction} seed={seed}: {log_file}",
-                    flush=True,
-                )
-                returncode, error = run_command(command, log_file, env)
-                if returncode != 0 or not output.is_file():
-                    record["status"] = "failed"
-                    record["error"] = (
-                        error or "evaluation exited successfully but produced no JSON"
+                if task_index is None:
+                    break
+                task = pending_tasks.pop(task_index)
+                dependency = task.get("dependency")
+                if dependency is not None and task_states[dependency] != "success":
+                    task_states[task["id"]] = "skipped"
+                    task["record"]["status"] = "skipped"
+                    task["record"]["error"] = "not run because a prerequisite task failed"
+                    write_summary(summary, run_dir)
+                    continue
+
+                gpu = available_gpus.pop(0)
+                task["record"]["status"] = "running"
+                task["record"]["gpu"] = gpu
+                if task["kind"] == "eval":
+                    task["record"].update({
+                        "checkpoint_file": str(task["checkpoint"]),
+                        "result_file": str(task["output"]),
+                        "log_file": str(task["log_file"]),
+                    })
+                    command = build_eval_command(
+                        python, task["source"], task["target"], task["seed"],
+                        task["checkpoint"], task["output"],
                     )
-                    summary["status"] = "failed"
-                    for pending in summary["evaluations"]:
-                        if pending["status"] == "pending":
-                            pending["status"] = "skipped"
-                            pending["error"] = "not run because an earlier task failed"
-                    update_aggregate(summary, groups)
-                    write_summary(summary, run_dir)
-                    print(f"FAILED: {record['error']}", flush=True)
-                    return 1
+                    label = (
+                        f"EVAL GPU={gpu} group={task['group_id']} "
+                        f"{task['direction']} seed={task['seed']}"
+                    )
+                else:
+                    command = build_train_command(
+                        python, task["dataset"], task["seed"], task["checkpoint"]
+                    )
+                    label = (
+                        f"TRAIN GPU={gpu} group={task['group_id']} "
+                        f"seed={task['seed']} dataset={task['dataset']}"
+                    )
+                env = os.environ.copy()
+                env["CUDA_VISIBLE_DEVICES"] = gpu
+                task_states[task["id"]] = "running"
+                print(f"{label}: {task['log_file']}", flush=True)
+                write_summary(summary, run_dir)
+                future = executor.submit(
+                    run_command, command, task["log_file"], env
+                )
+                running[future] = (task, gpu)
+
+            if not running:
+                if pending_tasks:
+                    raise RuntimeError("Experiment task dependencies could not be resolved")
+                break
+
+            completed, _ = wait(running, return_when=FIRST_COMPLETED)
+            for future in completed:
+                task, gpu = running.pop(future)
+                available_gpus.append(gpu)
+                available_gpus.sort(key=gpu_ids.index)
                 try:
-                    with output.open(encoding="utf-8") as handle:
-                        result = json.load(handle)
-                    record["accuracy"] = result.get("Accuracy")
-                    record["f1"] = result.get("F1-score")
-                    if record["accuracy"] is None or record["f1"] is None:
-                        raise ValueError(f"result lacks Accuracy/F1-score: {result}")
-                except (OSError, ValueError, json.JSONDecodeError) as exc:
-                    record["status"] = "failed"
-                    record["error"] = str(exc)
-                    summary["status"] = "failed"
-                    for pending in summary["evaluations"]:
-                        if pending["status"] == "pending":
-                            pending["status"] = "skipped"
-                            pending["error"] = "not run because an earlier task failed"
-                    update_aggregate(summary, groups)
-                    write_summary(summary, run_dir)
-                    print(f"FAILED: {record['error']}", flush=True)
-                    return 1
-                record["status"] = "success"
+                    returncode, error = future.result()
+                except Exception as exc:
+                    returncode, error = 1, str(exc)
+
+                record = task["record"]
+                if task["kind"] == "train":
+                    if returncode == 0 and task["checkpoint"].is_file():
+                        task_states[task["id"]] = "success"
+                        record["status"] = "success"
+                        record["returncode"] = 0
+                    else:
+                        task_states[task["id"]] = "failed"
+                        record["status"] = "failed"
+                        record["returncode"] = returncode
+                        record["error"] = error or (
+                            "training exited successfully but produced no checkpoint"
+                        )
+                        failed = True
+                        print(f"FAILED: {record['error']}", flush=True)
+                else:
+                    if returncode == 0 and task["output"].is_file():
+                        try:
+                            with task["output"].open(encoding="utf-8") as handle:
+                                result = json.load(handle)
+                            record["accuracy"] = result.get("Accuracy")
+                            record["f1"] = result.get("F1-score")
+                            if record["accuracy"] is None or record["f1"] is None:
+                                raise ValueError(
+                                    f"result lacks Accuracy/F1-score: {result}"
+                                )
+                        except (OSError, ValueError, json.JSONDecodeError) as exc:
+                            returncode, error = 1, str(exc)
+                    elif returncode == 0:
+                        returncode, error = 1, (
+                            "evaluation exited successfully but produced no JSON"
+                        )
+                    if returncode == 0:
+                        task_states[task["id"]] = "success"
+                        record["status"] = "success"
+                    else:
+                        task_states[task["id"]] = "failed"
+                        record["status"] = "failed"
+                        record["error"] = error
+                        failed = True
+                        print(f"FAILED: {record['error']}", flush=True)
                 write_summary(summary, run_dir)
 
-    summary["status"] = "complete"
+    summary["status"] = "failed" if failed else "complete"
     update_aggregate(summary, groups)
     write_summary(summary, run_dir)
-    print(f"COMPLETE: {run_dir}", flush=True)
-    return 0
+    print(f"{'FAILED' if failed else 'COMPLETE'}: {run_dir}", flush=True)
+    return 1 if failed else 0
 
 
 def main():
